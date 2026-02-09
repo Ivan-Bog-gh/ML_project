@@ -1,0 +1,32 @@
+# Автоматически определять текстовые файлы
+* text=auto
+
+# Python files - всегда LF
+*.py text eol=lf
+*.pyx text eol=lf
+
+# Config files - всегда LF
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+
+# Shell scripts - всегда LF
+*.sh text eol=lf
+
+# Markdown/Docs - всегда LF
+*.md text eol=lf
+*.rst text eol=lf
+
+# Windows-specific files - всегда CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files - не трогать
+*.png binary
+*.jpg binary
+*.parquet binary
+*.pkl binary
+*.h5 binary
