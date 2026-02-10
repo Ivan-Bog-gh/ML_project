@@ -1,6 +1,7 @@
 # My_data
-data/raw/*
+data/*
 .vscode
+*.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

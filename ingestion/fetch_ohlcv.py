@@ -14,11 +14,11 @@ import pandas as pd
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-# ────────────────────────────────────────────────
-#  Конфигурация
-# ────────────────────────────────────────────────
 
-RAW_DATA_DIR = Path("data/raw")
+# ─── CONFIG ────────────────────────────────────────────────────────────────
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Binance weight limit ~1200 в минуту → стараемся не превышать
@@ -46,8 +46,10 @@ TIMEFRAME_TO_BINANCE = {
 logger = logging.getLogger("binance_fetcher")
 
 
+# ─── HELPERS ───────────────────────────────────────────────────────────────
+
 def get_parquet_path(symbol: str, timeframe: str) -> Path:
-    """data/raw/BTCUSDT_5m.parquet"""
+    """data/raw/{symbol}_{timeframe}.parquet"""
     safe_symbol = symbol.replace("/", "").upper()
     safe_tf = timeframe.lower()
     return RAW_DATA_DIR / f"{safe_symbol}_{safe_tf}.parquet"
@@ -90,6 +92,8 @@ def save_data(df: pd.DataFrame, symbol: str, timeframe: str):
     )
     logger.info(f"Сохранено {len(df):,} строк → {path.name}")
 
+
+# ─── MAIN PIPELINE ─────────────────────────────────────────────────────────
 
 def fetch_ohlcv(
     symbol: str,
@@ -257,6 +261,7 @@ def fetch_ohlcv(
     logger.info(f"Итого свечей: {len(final_df):,}")
     return final_df
 
+# ─── CLI - runs from the command line ──────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
