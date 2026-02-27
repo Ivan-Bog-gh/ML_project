@@ -20,6 +20,11 @@ End-to-end ML-based crypto trading system (5-min bars) with strict leakage contr
 │   ├── interim/         	# cleaned, aligned
 │   ├── processed/         	# ready to feaches/models
 │
+├── dataset/
+│   ├── /__init__.py
+│   ├── build_dataset.py   # assembling dataset
+│   ├── splits.py          # split functions
+│
 ├── preprocessing/
 │   ├── /__init__.py
 │   ├── clean_ohlcv.py          # data cleaning + base sanity
@@ -42,6 +47,14 @@ End-to-end ML-based crypto trading system (5-min bars) with strict leakage contr
 ├── models/
 │   ├── baseline.py        # logistic / xgb
 │   ├── pipeline.py        # sklearn Pipeline
+│
+├── evaluation/ 
+│   ├── /__init__.py 
+│   ├── metrics.py             # Base metrics (precision, ROC AUC, etc.) 
+│   ├── calibration.py
+│   ├── threshold_selection.py
+│   └── comparison.py          # models comparison
+│   └── strategies.py          # Description of strategy classes
 │
 ├── backtest/
 │   ├── engine.py
@@ -300,3 +313,185 @@ Feature Engineering v1 is designed to be:
 -	execution-aware
 
 More complex transformations (nonlinear interactions, regime-dependent features, meta-features) are intentionally deferred to later stages after establishing a robust baseline.
+
+
+## Feature Engineering v1.1 — Extensions
+
+- The main purpose of expanding the list of features is to improve the quality of the model by covering other parameters of the market condition.
+
+### New feature groups
+
+Building on v1, the following feature groups were added in v1.1.
+
+-	Volatility regime positioning — rolling percentile rank of the 20-bar log-return standard deviation over longer windows [60, 120 bars]. 
+	Captures where current volatility sits within its historical distribution, enabling regime-aware signal filtering.
+
+-	Volatility expansion — ratio and difference between short-horizon (10-bar) and medium-horizon (20-bar) realized volatility. 
+	Identifies vol compression and expansion states without introducing future dependency.
+
+-	Volatility of volatilit — rolling standard deviation of the 20-bar vol series over a 20-bar window. 
+	Measures instability of the volatility regime itself; elevated values indicate structurally uncertain market conditions.
+
+-	Realized skewness — rolling skewness of log-returns over [20, 60] bar windows. 
+	Asymmetric return distributions are associated with directional pressure and are not captured by symmetric volatility measures.
+
+-	Intrabar close position — rolling mean of (close − low) / (high − low) over the same windows. 
+	A price-action proxy for within-bar directional conviction, computed entirely from available OHLC data.
+
+All features are computed using strictly past information. Warmup periods and `suspend_flag` propagation follow the same logic as v1.
+
+Config changes: `percentile_windows: [60, 120]` added under `volatility`; new `realized_skewness` block with `windows: [20, 60]`.
+
+
+## Dataset Assembly
+
+A dedicated `dataset/` module handles the assembly of modeling-ready datasets.
+
+- `build_dataset.py` — joins feature matrix with labels and metadata, enforces index alignment, drops rows invalidated by `suspend_flag`
+- `splits.py` — provides walk-forward train/validation split functions consistent with the no-leakage requirement
+
+This layer sits between feature engineering and model training, keeping each stage independently testable and reproducible.
+
+
+## Models
+
+`models/baseline.py` implements `BaselineClassifier`: a sklearn `Pipeline` (StandardScaler → estimator) defaulting to logistic regression. 
+Optional probability calibration is available via `CalibratedClassifierCV` with time-series-safe cross-validation.
+
+`ExpectedValueTrader` is a decision layer on top of two fitted classifiers:
+
+	- `model_hit` — binary classifier: will price move at all? {0, 1}
+	- `model_direction` — directional classifier conditioned on a hit: {−1, +1}
+
+Expected value is computed as:
+```
+	EV_long  = P(long)  × R − P(short) × L − commission
+	EV_short = P(short) × R − P(long)  × L − commission
+```
+
+Signals are generated only when EV exceeds a configurable minimum threshold.
+
+
+## Evaluation Framework
+
+The `evaluation/` module provides a structured approach to strategy comparison.
+
+-	Metrics (`metrics.py`) — overall precision, long/short precision split, trade frequency, number of trades, F1, ROC AUC.
+
+-	Calibration (`calibration.py`) — reliability diagrams and Expected Calibration Error (ECE).
+	Well-calibrated probabilities are a prerequisite for valid EV computation.
+
+-	Threshold selection (`threshold_selection.py`) — systematic sweep over probability thresholds to identify the precision / trade-frequency frontier.
+
+-	Strategies (`strategies.py`) — abstract `TradingStrategy` base class with three concrete implementations:
+
+	- `BaselineStrategy` — single multiclass model with a probability threshold
+	- `TwoStageStrategy` — sequential hit filter followed by direction prediction
+	- `EVStrategy` — signal generation via expected value with configurable minimum EV and minimum probability constraints
+
+-	Comparison (`comparison.py`) — `StrategyComparison` class that evaluates a list of strategies against a validation set, stores results, and produces ranked summary tables. 
+	Supports grid search over strategy hyperparameters via `compare_strategies_grid`.
+	
+### Design note
+
+Strategy hyperparameters (thresholds, minimum EV) are selected on the
+validation fold only. No strategy parameter influences the training procedure,
+preserving the integrity of walk-forward evaluation.
+
+
+## Model Research Log
+
+-	This section documents modeling experiments conducted after the v1.1 baseline.
+-	All results are compared against the reference baseline trained on fixed symmetric labels with a single 3-class logistic regression.
+
+**Baseline reference:** `precision: 0.199`, `trade_freq: 0.0167`
+
+Results are recorded regardless of outcome. Negative results are considered informative and retained for reproducibility.
+
+
+### Experiment 1 — Volatility-adaptive label thresholds
+
+**Motivation.**
+	Fixed TP/SL thresholds treat all market states equally.
+	The hypothesis was that scaling the barrier by current volatility (ATR-based) would produce classes that are more statistically homogeneous across regimes, 	making the classification problem easier.
+
+**Implementation.**
+	The fixed `threshold` in `labeling/targets.py` was replaced with a per-bar adaptive threshold proportional to a rolling ATR estimate.
+	Labels were regenerated and the model was retrained on identical features.
+
+**Result.**
+	ROC AUC declined. Predicted probability distributions degraded.
+	`precision: 0.161`, `trade_freq: 0.0066`.
+
+**Conclusion.**
+	Classes became more uniform statistically, but less predictable economically.
+	The most likely cause: vol-scaling introduced collinearity between label construction and existing volatility features. 
+	The barrier is now a function of ATR, which is already present in the feature matrix — this reduces the	marginal information content of volatility features and weakens model calibration. 
+	Vol-scaled labels require either volatility-orthogonal features or a fundamentally different feature set.
+
+
+### Experiment 2 — Two-stage model: hit vs. no-hit + direction
+
+**Motivation.**
+	A single 3-class classifier must simultaneously learn two distinct decisions:
+	-	whether a tradeable move will occur, and in which direction. 
+	Decomposing this into two simpler binary tasks was expected to improve calibration and allow independent tuning of each decision boundary.
+
+**Implementation.**
+	`BaselineClassifier` was retained as the base estimator for both models.
+	- Model 1 (`model_hit`): binary, trained on `{0, 1}` where `±1 → 1`.
+	- Model 2 (`model_direction`): binary, trained on `{−1, +1}` restricted to hit samples only.
+	An `ExpectedValueTrader` layer combined both outputs into final signals.
+	Several supplementary market-state features were added (see v1.1 extensions).
+
+**Result.**
+	Model flexibility increased. 
+	Precision improved marginally over Experiment 1 but did not surpass the baseline. 
+	`precision: 0.174`, `trade_freq: 0.011`.
+
+**Conclusion.**
+	Training on all market states indiscriminately limits the signal available to both models. 
+	In low-information market conditions (majority of bars), the direction model has no meaningful basis for a decision. 
+	The two-stage architecture is sound, but requires a preceding market-state filter to restrict the sample to periods where alpha is plausibly present.
+
+
+### Experiment 3 — CUSUM pre-filter for market state selection
+
+**Motivation.**
+	A core assumption of all prior experiments is that every bar is a valid training candidate. 
+	In practice, most 5-minute bars occur during low-activity periods where no directional signal exists. 
+	A CUSUM-based event filter (following Lopez de Prado, *Advances in Financial Machine Learning*) was applied to isolate bars where cumulative price deviation exceeded a threshold, restricting training and inference to periods of detectable market activity.
+
+**Implementation.**
+	A symmetric CUSUM filter was implemented over log-returns with a tuned threshold. 
+	Triggered events reduced the active sample from 100% of bars to approximately 3%. 
+	Models from Experiment 2 were retrained on this filtered dataset.
+
+**Result.**
+	ROC AUC on the direction model collapsed. Precision and trade frequency shifted significantly: 
+	`precision: 0.1384`, `trade_freq: 0.1334`.
+
+**Conclusion.**
+	At ~3% of the original sample size, the feature matrix is too high-dimensional for the available observations. 
+	The model cannot generalize: the ratio of features to training samples is unfavorable. 
+	Two corrective directions are identified:
+
+	- **Loosen the filter** — use a lower CUSUM threshold to retain a larger fraction of bars while still excluding the quietest periods.
+	- **Reduce feature dimensionality** — apply explicit feature selection before filtering to keep only the most informative inputs given the reduced sample.
+
+The CUSUM pre-filtering concept is retained as a structural component of the pipeline. 
+Tuning of filter sensitivity is deferred to the next iteration.
+
+
+### Summary
+
+| Experiment | Key change | Precision | Trade Freq | vs. Baseline |
+|---|---|---|---|---|
+| Baseline | Fixed labels, 3-class logistic | 0.199 | 0.0167 | — |
+| Exp 1 | Vol-adaptive labels | 0.161 | 0.0066 | ↓ |
+| Exp 2 | Two-stage hit + direction | 0.174 | 0.0110 | ↓ |
+| Exp 3 | CUSUM filter + two-stage | 0.138 | 0.1334 | ↓ |
+
+**Primary bottleneck identified:** 
+	the model is trained and evaluated on all market states without qualitative discrimination. 
+	Meaningful alpha extraction likely requires either a well-calibrated regime filter or a fundamentally different label construction that is orthogonal to the existing feature set.

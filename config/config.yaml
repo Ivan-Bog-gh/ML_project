@@ -17,6 +17,10 @@ features:
   volatility:
     atr_window: 14
     vol_windows: [10, 20]
+    percentile_windows: [60, 120]  # для regime positioning
+    
+  realized_skewness:
+    windows: [20, 60]
 
   range:
     windows: [10, 20]

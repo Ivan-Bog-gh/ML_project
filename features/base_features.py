@@ -179,6 +179,7 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
 def compute_volatility(df: pd.DataFrame) -> pd.DataFrame:
     atr_w = FEATURE_CONFIG["volatility"]["atr_window"]
     vol_ws = FEATURE_CONFIG["volatility"]["vol_windows"]
+    percentile_ws = FEATURE_CONFIG["volatility"]["percentile_windows"]
     
     atr = compute_atr(df["high"], df["low"], df["close"], atr_w)
     norm_atr = atr / df["close"]
@@ -191,9 +192,25 @@ def compute_volatility(df: pd.DataFrame) -> pd.DataFrame:
     for w in vol_ws:
         vol_feats[f"vol_logret_{w}"] = logret.rolling(w).std()
     
+    # (A) Volatility regime positioning
+    vol_20 = logret.rolling(20).std()
+    for w in percentile_ws:
+        # vol_feats[f"vol_percentile_{w}"] = vol_20.rolling(w).apply(
+        #     lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
+        # )
+        vol_feats[f"vol_percentile_{w}"] = vol_20.rolling(w).rank(pct=True)
+
+    # (B) Volatility slope / expansion
+    vol_10 = logret.rolling(10).std()
+    vol_feats["vol_expansion_ratio"] = vol_10 / (vol_20 + 1e-8)  # ratio
+    vol_feats["vol_expansion_diff"] = vol_10 - vol_20  # difference
+    
+    # (C) Volatility of volatility
+    vol_feats["vol_of_vol_20"] = vol_20.rolling(20).std()
+    
     df_vol = pd.DataFrame(vol_feats, index=df.index)
     
-    max_window = max(atr_w, max(vol_ws))
+    max_window = max(atr_w, max(vol_ws), max(percentile_ws))
     invalid_mask = mark_invalid_rows(df, max_window)
     df_vol[invalid_mask] = np.nan
     
@@ -283,6 +300,31 @@ def compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(feats, index=df.index).add_prefix("time__")
 
 
+def compute_realized_skewness(df: pd.DataFrame) -> pd.DataFrame:
+    windows = FEATURE_CONFIG["realized_skewness"]["windows"]
+    
+    logret = np.log(df["close"] / df["close"].shift(1))
+    
+    feats = {}
+    for w in windows:
+        feats[f"realized_skew_{w}"] = logret.rolling(w).skew()
+    
+    # Дополнительно: intrabar directional movement (если есть OHLC)
+    intrabar_range = df["high"] - df["low"]
+    close_position = (df["close"] - df["low"]) / (intrabar_range + 1e-8)  # 0 = close at low, 1 = close at high
+    
+    for w in windows:
+        feats[f"close_position_mean_{w}"] = close_position.rolling(w).mean()
+    
+    df_skew = pd.DataFrame(feats, index=df.index)
+    
+    max_window = max(windows)
+    invalid_mask = mark_invalid_rows(df, max_window)
+    df_skew[invalid_mask] = np.nan
+    
+    return df_skew.add_prefix("skewness__")
+
+
 # ─── MAIN PIPELINE ─────────────────────────────────────────────────────────
 
 FEATURE_COMPUTERS = [
@@ -292,6 +334,7 @@ FEATURE_COMPUTERS = [
     compute_liquidity_features,
     compute_volume_features,
     compute_time_features,
+    compute_realized_skewness,  # <- новая функция
 ]
 
 

@@ -54,10 +54,12 @@ def process_raw_to_interim(symbol: str, timeframe: str):
     success = run_all_validations(df, timeframe)
     
     if success:
+        df = df.set_index("open_time") # Проверка в run_all_validations()
+        df.index = pd.to_datetime(df.index)
         try:
             df.to_parquet(
                 interim_path,
-                index=False,
+                index=True,
                 compression="zstd",
                 engine="pyarrow"
             )

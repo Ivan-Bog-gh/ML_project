@@ -47,7 +47,7 @@ def _label_chunk_optimized(args):
     Оптимизированная обработка: итерация по времени (tl),
     а не по каждой строке полностью
     """
-    i_start, i_end, close, high, low, tl, threshold = args
+    i_start, i_end, close, high, low, tl, thresholds = args
     
     n_rows = i_end - i_start
     labels = np.full(n_rows, np.nan, dtype=np.float32)  # изначально все NaN
@@ -57,8 +57,9 @@ def _label_chunk_optimized(args):
     
     # Предвычисляем границы для всех активных строк
     entries = close[i_start:i_end]
-    upper_bounds = entries * (1 + threshold)
-    lower_bounds = entries * (1 - threshold)
+    row_thresholds = thresholds[i_start:i_end]
+    upper_bounds = entries * (1 + row_thresholds)
+    lower_bounds = entries * (1 - row_thresholds)
     
     # Итерируемся по шагам времени вперёд
     for t in range(1, tl + 1):
@@ -114,7 +115,7 @@ def compute_event_labels_optimized(
     symbol: str, 
     timeframe: str,
     tl: int = 12,
-    threshold: float = 0.003,
+    k: float = 1.5,  # множитель для сигмы (было threshold)
     price_col: str = 'close',
     high_col: str = 'high',
     low_col: str = 'low',
@@ -133,7 +134,14 @@ def compute_event_labels_optimized(
         return
         
     df = pd.read_parquet(interim_path)
-        
+    
+    # Расчет log returns и rolling std
+    log_returns = np.log(df[price_col] / df[price_col].shift(1))
+    rolling_std = log_returns.rolling(window=tl).std()
+
+    # Динамические пороги для каждой строки
+    thresholds = (k * rolling_std * np.sqrt(tl)).fillna(0).values  # заполняем NaN нулями
+
     close = df[price_col].values
     high = df[high_col].values
     low = df[low_col].values
@@ -144,7 +152,7 @@ def compute_event_labels_optimized(
     chunk_size = max(1000, n // n_cores + 1)
     
     chunks = [
-        (i, min(i + chunk_size, n), close, high, low, tl, threshold)
+        (i, min(i + chunk_size, n), close, high, low, tl, thresholds)
         for i in range(0, n, chunk_size)
     ]
     
@@ -155,11 +163,11 @@ def compute_event_labels_optimized(
     labels = np.concatenate(results)
     labels[-tl:] = np.nan # Сразу мьючу последние строки
     
-    labels_df = pd.DataFrame({'label': labels})
+    labels_df = pd.DataFrame({'label': labels}, index=df.index)
     
     labels_df.to_parquet(
         processed_path,
-        index=False,
+        index=True,
         compression="zstd",          # или "gzip", "snappy"
         engine="pyarrow",
     )
@@ -178,7 +186,8 @@ if __name__ == "__main__":
     parser.add_argument("--symbol",     default="BTCUSDT",      help="Торговая пара")
     parser.add_argument("--timeframe",  default="5m",           help="Таймфрейм")
     parser.add_argument("--tl",         default=12,             help="Горизонт событий")
-    parser.add_argument("--threshold",  default=0.01,          help="Границы определения событий")
+    parser.add_argument("--k",          default=1.5,            help="Множитель для сигмы")
+    # parser.add_argument("--threshold",  default=0.01,          help="Границы определения событий")
     parser.add_argument("--no-args",    action="store_true",    help="Использовать значения по умолчанию без argparse")
 
     args = parser.parse_args()
@@ -188,11 +197,11 @@ if __name__ == "__main__":
         symbol      = "BTCUSDT"
         timeframe   = "5m"
         tl          = 12
-        threshold   = 0.01
+        k           = 1.8
     else:
         symbol      = args.symbol
         timeframe   = args.timeframe
         tl          = args.tl
-        threshold   = args.threshold
+        k           = args.k
 
-    compute_event_labels_optimized(symbol=symbol, timeframe=timeframe, tl=tl, threshold=threshold)
+    compute_event_labels_optimized(symbol=symbol, timeframe=timeframe, tl=tl, k=k)
