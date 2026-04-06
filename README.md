@@ -58,22 +58,10 @@ End-to-end ML-based crypto trading system (5-min bars) with strict leakage contr
 │
 ├── backtest/
 │   ├── engine.py
-│   ├── costs.py
-│   ├── metrics.py
-│
-├── risk/
-│   ├── position_sizing.py
-│   ├── kill_switch.py
-│
-├── api/
-│   └── app.py             # FastAPI (позже)
+│   ├── walk_forward.py
 │
 ├── config/
 │   └── config.yaml
-│
-├── tests/
-│   ├── test_features.py
-│   └── test_backtest.py
 │
 └── README.md
 
@@ -348,7 +336,8 @@ Config changes: `percentile_windows: [60, 120]` added under `volatility`; new `r
 A dedicated `dataset/` module handles the assembly of modeling-ready datasets.
 
 - `build_dataset.py` — joins feature matrix with labels and metadata, enforces index alignment, drops rows invalidated by `suspend_flag`
-- `splits.py` — provides walk-forward train/validation split functions consistent with the no-leakage requirement
+- `splits.py` — produces three strictly non-overlapping temporal sets: `train` (model fitting), `val` (strategy selection), `test` (single final evaluation). 
+	Prevents selection bias from reusing test data during hyperparameter search.
 
 This layer sits between feature engineering and model training, keeping each stage independently testable and reproducible.
 
@@ -358,45 +347,108 @@ This layer sits between feature engineering and model training, keeping each sta
 `models/baseline.py` implements `BaselineClassifier`: a sklearn `Pipeline` (StandardScaler → estimator) defaulting to logistic regression. 
 Optional probability calibration is available via `CalibratedClassifierCV` with time-series-safe cross-validation.
 
-`ExpectedValueTrader` is a decision layer on top of two fitted classifiers:
+`BarrierEstimator` precomputes per-bar dynamic SL/TP estimates once across the dataset. 
+	This decouples barrier computation from per-strategy EV evaluation — each strategy reads 
+	precomputed values instead of recalculating them independently, keeping grid search efficient.
 
-	- `model_hit` — binary classifier: will price move at all? {0, 1}
-	- `model_direction` — directional classifier conditioned on a hit: {−1, +1}
+`clone_unfitted()` produces a clean copy of any fitted classifier with weights reset. 
+	Used in WFA to reinitialize models across folds without reconstructing the pipeline from config each time.
+
+`ExpectedValueTrader` has been removed. EV logic now lives exclusively inside `EVStrategy` in `evaluation/strategies.py`, eliminating the overlap between decision logic and model layer.
 
 Expected value is computed as:
 ```
-	EV_long  = P(long)  × R − P(short) × L − commission
-	EV_short = P(short) × R − P(long)  × L − commission
+	EV_long  = P(long)  × R − P(short) × L − P(trade_timeout) * EV_false_long_trade
+	EV_short = P(short) × R − P(long)  × L − P(trade_timeout) * EV_false_short_trade
 ```
 
-Signals are generated only when EV exceeds a configurable minimum threshold.
+Signals are generated only when EV exceeds a configurable minimum (0 at least) threshold.
 
 
 ## Evaluation Framework
 
 The `evaluation/` module provides a structured approach to strategy comparison.
 
--	Metrics (`metrics.py`) — overall precision, long/short precision split, trade frequency, number of trades, F1, ROC AUC.
+-	Metrics (`metrics.py`) — overall precision, long/short precision split, trade frequency, number of trades, F1, ROC AUC(multiclass OvR macro).
 
 -	Calibration (`calibration.py`) — reliability diagrams and Expected Calibration Error (ECE).
 	Well-calibrated probabilities are a prerequisite for valid EV computation.
 
 -	Threshold selection (`threshold_selection.py`) — systematic sweep over probability thresholds to identify the precision / trade-frequency frontier.
 
--	Strategies (`strategies.py`) — abstract `TradingStrategy` base class with three concrete implementations:
+-	Strategies (`strategies.py`) — fully rewritten. A strategy object encapsulates one or more fitted models plus decision thresholds 
+	and exposes two outputs: signals `{−1, 0, +1}` and per-trade confidence weights used downstream by the backtest engine.
 
-	- `BaselineStrategy` — single multiclass model with a probability threshold
-	- `TwoStageStrategy` — sequential hit filter followed by direction prediction
-	- `EVStrategy` — signal generation via expected value with configurable minimum EV and minimum probability constraints
+	Shared logic consolidated into the abstract base class `TradingStrategy`:
+		- `fit_models()` / `evaluate_models()` — model training and scoring
+		- `compute_expected_value()` — EV computation against precomputed barriers
+		- `_get_clean_probs()` — probability extraction with calibration applied
+		- Calibration parameters stored as base class attributes
+
+	Three concrete strategy implementations are retained:
+		- `BaselineStrategy` — single multiclass model with a probability threshold with minimal EV > 0 treshold for signals
+		- `TwoStageStrategy` — sequential hit filter followed by direction prediction with minimal EV > 0 treshold for signals
+		- `EVStrategy` — signal generation via expected value with configurable minimum EV and minimum probability constraints
 
 -	Comparison (`comparison.py`) — `StrategyComparison` class that evaluates a list of strategies against a validation set, stores results, and produces ranked summary tables. 
 	Supports grid search over strategy hyperparameters via `compare_strategies_grid`.
 	
+	Key updates:
+		- Primary ranking criterion changed from `precision` to Expected Return per Signal (ERS), consistent with backtest EV formulation
+		- `get_best_strategy()` supports a blacklist of strategy identifiers to exclude configurations that failed prior WFA folds (insufficient sample, negative ERS across multiple folds, etc.)
+		- `print_summary()` no longer dumps raw strategy objects or internal parameters — output is limited to economically meaningful metrics
+	
 ### Design note
 
-Strategy hyperparameters (thresholds, minimum EV) are selected on the
-validation fold only. No strategy parameter influences the training procedure,
-preserving the integrity of walk-forward evaluation.
+Strategy hyperparameters (thresholds, minimum EV) are selected on the validation fold only. 
+No strategy parameter influences the training procedure, preserving the integrity of walk-forward evaluation.
+
+### Strategy selection protocol
+```
+	train  → fit_models() + fit()
+	val    → rank strategies by ERS → apply blacklist filter → select best
+	test   → single final evaluation, never used for selection
+```
+
+No strategy hyperparameter is chosen using test data. Test is accessed exactly once per WFA fold.
+
+
+## Backtest and Walk-Forward Analysis
+
+`backtest/engine.py` — bar-by-bar simulation. Per-trade P&L is computed as:
+```
+	P&L = signal × realized_return − (commission + slippage) × 2
+```
+
+Commission and slippage are applied symmetrically on entry and exit.
+Position sizing follows `config.backtest.position_size` as a fixed fraction of current capital. Kill switch activates if drawdown exceeds `config.risk.max_drawdown`.
+
+`backtest/walk_forward.py` — aggregates per-fold out-of-sample results into a continuous equity curve and computes:
+	- annualized Sharpe ratio
+	- maximum drawdown
+	- strategy consistency (fraction of folds where selected strategy
+	  had positive ERS on test)
+	- fold-level breakdown for regime analysis
+	
+### Backtest Rules
+
+- One position at a time — no overlapping trades
+- Triple barrier exit: position closes on whichever comes first — TP, SL, or horizon timeout
+- No leverage — full capital exposure per position size
+- Round-trip commission applied on every entry and exit
+
+### WFA loop structure
+```
+for each fold:
+    train  → fit models & fit strategy (for val)
+    val    → select best strategy by ERS (with blacklist)
+    test   → evaluate selected strategy → record OOS result
+
+aggregate OOS results → equity curve → final metrics
+```
+
+Each fold selects its own best strategy independently. 
+Strategy identity is allowed to vary across folds — this is intentional and reflects adaptive behavior under changing market regimes.
 
 
 ## Model Research Log

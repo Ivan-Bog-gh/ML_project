@@ -13,7 +13,11 @@ sys.path.append(str(PROJECT_ROOT))
 
 from dataset.build_dataset import build_dataset
 from dataset.splits import time_split
-from models.baseline import BaselineClassifier, ExpectedValueTrader
+from models.baseline import BarrierEstimator, BaselineClassifier
+
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
 
 from evaluation.strategies import (
     BaselineStrategy,
@@ -21,6 +25,10 @@ from evaluation.strategies import (
     EVStrategy
 )
 from evaluation.comparison import StrategyComparison, compare_strategies_grid
+
+from backtest.engine import BacktestEngine
+from backtest.walk_forward import WalkForwardAnalysis
+from backtest.metrics import calculate_performance_metrics, print_performance_summary
 
 
 
@@ -31,7 +39,7 @@ CONFIG_DIR      = PROJECT_ROOT / "config"
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────
 
-def load_feature_config(config_path=None):
+def load_config(config_path=None):
     """Загрузка конфигурации фич из YAML файла"""
     if config_path is None:
         # Автоматический поиск config.yaml
@@ -51,7 +59,7 @@ def load_feature_config(config_path=None):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    return config.get('features', {})
+    return config
 
 
 def calculate_max_window(feature_config):
@@ -95,24 +103,6 @@ def compute_trade_metrics(y_true, y_pred):
     return metrics
 
 
-def getTEvents(gRaw, h):
-    '''
-        Применение CUSUM-метода для отлавливания ситуаций, когда цена вышла из проторговки
-        gRaw = ряд метрик (цена/индикаторы/прочее), которые смотрим на уход из проторговки
-        tEvents = ряд timestamp-ов, когда произошло событие для включения дальнейшей стратегии (Мета-маркировка)
-    '''
-    tEvents, sPos, sNeg = [], 1, 1
-    diff = gRaw.diff() / gRaw.shift(1) # относительное изменение цены
-    for i in diff.index[1:]:
-        sPos, sNeg = max(1,sPos * (1 + diff.loc[i])), min(1, sNeg * (1 + diff.loc[i]))
-        if sNeg < 1 - h:
-            sNeg = 1
-            tEvents.append(i)
-        elif sPos > 1 + h:
-            sPos = 1
-            tEvents.append(i)
-    return pd.DatetimeIndex(tEvents)
-
 # ─── MAIN PIPELINE ─────────────────────────────────────────────────────────
 
 def run_pipeline(
@@ -125,125 +115,128 @@ def run_pipeline(
     path_interim    = INTERIM_DIR / f"{symbol}_{timeframe}.parquet"
     path_features   = PROCESSED_DIR / f"{symbol}_{timeframe}_features.parquet"
     path_labels     = PROCESSED_DIR / f"{symbol}_{timeframe}_labels.parquet"
-    # path_events     = PROCESSED_DIR / f"{symbol}_{timeframe}_events_0.01.parquet"
 
     df_interim = pd.read_parquet(path_interim)
     features = pd.read_parquet(path_features)
     labels = pd.read_parquet(path_labels)
-    # events = pd.read_parquet(path_events)
-    # print(events.head())
 
     print(f"Loaded interim data: {df_interim.shape}, features: {features.shape}, labels: {labels.shape}")
-    feature_config  = load_feature_config(CONFIG_DIR / config)
+    config_file  = load_config(CONFIG_DIR / config)
+    feature_config = config_file['features']
     max_lookback    = calculate_max_window(feature_config)
     
     df = build_dataset(features, labels['label'], df_interim["is_suspended"], max_lookback=max_lookback)
- 
-    # print(f"Dataset before applying CUSUM filter: {df.shape}")
-    # df = df[df.index.isin(events.index)]
-    # print(f"Dataset after applying CUSUM filter: {df.shape}")
     
     # split
     print(f"Splitting dataset by time...")
-    train, val = time_split(df, split_date="2025-01-01")
+    val_start_date = config_file['training']['val_start']
+    test_start_date = config_file['training']['test_start']
+    time_periods = time_split(df, time_periods=[val_start_date, test_start_date])#"2025-01-01")
+    if len(time_periods) != 3:
+        raise ValueError(f"Expected 3 time periods (train, val, test), but got {len(time_periods)}. Check your time_periods configuration.")
+    train, val, test = time_periods
+
+    print(f"Train: {train.index.min()} to {train.index.max()} ({len(train)} samples)")
+    print(f"Val: {val.index.min()} to {val.index.max()} ({len(val)} samples)")
+    print(f"Test: {test.index.min()} to {test.index.max()} ({len(test)} samples)")
 
     X_train, y_train = train.drop(columns="label"), train["label"]
-    X_val, y_val = val.drop(columns="label"), val["label"] # ~2,500 samples
-
-    # create binary classification: hit OR no hit
-    y_train_hit = y_train.replace(-1, 1) # 0 = no-hit, 1 = hit (long or short)
-    y_val_hit = y_val.replace(-1, 1)
-    print(f"y_train_hit value counts (normalized):")
-    print(y_train_hit.value_counts(normalize=True))
-    print(f"y_val_hit value counts (normalized):")
-    print(y_val_hit.value_counts())
+    X_val, y_val = val.drop(columns="label"), val["label"]
+    X_test, y_test = test.drop(columns="label"), test["label"]
     
-    # train hit classifier (hit vs no hit)
-    print(f"Training hit classifier...")
-    clf_hit = BaselineClassifier(calibrate=True, calibration_method="isotonic")
-    clf_hit.fit(X_train, y_train_hit)
-    clf_hit_metrics = clf_hit.evaluate_roc_auc(X_val, y_val_hit)
-    print(f"Hit classifier ROC AUC: {clf_hit_metrics['roc_auc']:.4f}")
+    # Подтягиваю настройки модели из config
+    config_model_dict = {
+        "lgbm_regression": LGBMClassifier,
+        "XGBC_regression": XGBClassifier,
+        "logistic_regression": LogisticRegression
+    }
+    config_model = config_file['model']
+    if config_model['type'] not in config_model_dict.keys():
+        raise(f"Invalid model type {config_model['type']}. Possible options: {' / '.join(config_model_dict.keys())}")
+    estimator = config_model_dict[config_model['type']](
+        **config_model['params']
+    )
 
-    # create dataset for directional classifier (только hit)
-    bin_mask_train = y_train != 0
-    bin_mask_val = y_val != 0
-    X_train_bin, y_train_bin = X_train[bin_mask_train], y_train[bin_mask_train]
-    X_val_bin, y_val_bin = X_val[bin_mask_val], y_val[bin_mask_val]
-    print(f"y_train_bin value counts (normalized):")
-    print(y_train_bin.value_counts(normalize=True))
-    print(f"y_val_bin value counts (normalized):")
-    print(y_val_bin.value_counts())
-
-    # train Directional classifier
-    print(f"Training Directional classifier...")
-    clf_direction = BaselineClassifier(calibrate=True, calibration_method="isotonic")
-    clf_direction.fit(X_train_bin, y_train_bin)
-    clf_direction_metrics = clf_direction.evaluate_roc_auc(X_val_bin, y_val_bin)
-    print(f"Directional classifier ROC AUC: {clf_direction_metrics['roc_auc']:.4f}")
-
-    # train all-in-one baseline
-    print(f"\nTraining baseline classifier...")
-    clf_baseline = BaselineClassifier()
-    clf_baseline.fit(X_train, y_train)
-    baseline_metrics = clf_baseline.evaluate(X_val, y_val, threshold=0.5)
-    print(f"Baseline Precision: {baseline_metrics['precision']:.4f}")
-    print(f"Baseline Trade Freq: {baseline_metrics['trade_freq']:.4f}")
-
-    # ================== СОЗДАНИЕ СТРАТЕГИЙ ==================
+    # Расчет границ для последующих оценок EV стратегий
+    com_rate = (config_file['backtest']['commission_bps'] + config_file['backtest']['slippage_bps']) / 10000
+    barrier_configs = {
+        "atr_window": config_file['labeling']['horizon_bars'],
+        "k": config_file['labeling']['threshold'],
+        "com_rate": com_rate,
+    } # slippage + commission из расчета, что объем позиции почти не двигает цену
+    barriers = BarrierEstimator(**barrier_configs).fit(df_interim)
+    
+    # ================== WALK-FORWARD VALIDATION ==================
     
     print(f"\n{'='*80}")
-    print("STRATEGY COMPARISON")
+    print("WALK-FORWARD VALIDATION")
     print(f"{'='*80}\n")
     
-    comparison = StrategyComparison()
+    # Создаем стратегию для WF (обнуление моделей внутри WFA)
+    wf_models = {
+        "model_hit": BaselineClassifier(estimator=estimator, calibrate=True, calibration_method="isotonic"),
+        "model_direction": BaselineClassifier(estimator=estimator, calibrate=True, calibration_method="isotonic"),
+        "model_baseline": BaselineClassifier(estimator=estimator, calibrate=True, calibration_method="isotonic"),
+    }
     
-    # Стратегия 1: Baseline с разными thresholds
-    print("Creating Baseline strategies...")
-    for thresh in [0.35, 0.4, 0.5, 0.6, 0.65, 0.7]:
-        strategy = BaselineStrategy(
-            name=f"Baseline_thresh{thresh:.2f}",
-            model=clf_baseline,
-            threshold=thresh,
-        )
-        comparison.evaluate_strategy(strategy, X_val, y_val)
+    wf_validator = WalkForwardAnalysis(
+        models=wf_models,
+        com_rate=com_rate,
+        initial_capital=config_file['backtest']['initial_capital'],
+        mdd=config_file['risk']['max_drawdown'],
+    )
     
-    # Стратегия 2: Two-Stage с grid search
-    print("\nCreating TwoStage strategies...")
-    for hit_thresh in [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]:  # можно варьировать threshold для hit-модели
-        for dir_thresh in [0.5]: # [0.5, 0.6, 0.7]
-            strategy = TwoStageStrategy(
-                name=f"TwoStage_h{hit_thresh:.2f}_d{dir_thresh:.1f}",
-                model_hit=clf_hit,
-                model_direction=clf_direction,
-                hit_threshold=hit_thresh,
-                direction_threshold=dir_thresh,
-            )
-            comparison.evaluate_strategy(strategy, X_val, y_val)
+    # Split схема
+    parts = [0.6, 0.2, 0.2]  # Train 60%, Val 20%, Test 20%
+    start_end_wfa_splits = [
+        [0.0, 0.8],  # start 0%, end 80% для 1 шага WFA
+        [0.2, 1.0],  # start 0%, end 100% для 2 шага WFA
+    ]
+    splits = [tuple(parts + a_b) for a_b in start_end_wfa_splits] # комбинируем одинаковое разбиение с разными start/end точками для WFA
     
-    # ================== РЕЗУЛЬТАТЫ ==================
-
-    min_trades_part = 0.01  # Минимальная доля трейдов от общего количества для отображения стратегии
+    # Набор стратегий
+    Baseline_Strategies = {
+        "name": "Baseline",
+        "model": BaselineStrategy,
+        "required_models": ["model_baseline"],
+        "hyperparams": {
+            "threshold": [0.35, 0.4, 0.5, 0.6, 0.65, 0.7],
+        }
+    }
+    TwoStage_Strategies = {
+        "name": "TwoStage",
+        "model": TwoStageStrategy,
+        "required_models": ["model_hit", "model_direction"],
+        "hyperparams": {
+            "hit_threshold": [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
+            "direction_threshold": [0.5, 0.6],
+        }
+    }
+    EV_Strategies = {
+        "name": "EV",
+        "model": EVStrategy,
+        "required_models": ["model_hit", "model_direction"],
+        "hyperparams": {
+            "min_ev": [0.0, 0.001, 0.002],
+            "min_probability": [0.0, 0.05, 0.1, 0.15, 0.20, 0.25],
+        }
+    }
+    strategies = {
+        "Baseline": Baseline_Strategies,
+        "TwoStage": TwoStage_Strategies,
+        "EV": EV_Strategies,
+    }
     
-    # Вывод топ-10 стратегий
-    comparison.print_summary(top_n=10, min_trades_part=min_trades_part)  # Фильтр по минимальной частоте трейдов (например, 1%)
-    
-    # Детальное сравнение по precision
-    print("\nDetailed comparison:")
-    df = comparison.get_comparison_table(sort_by="precision", min_trades_part=min_trades_part)  # Фильтр по минимальной частоте трейдов (например, 1%)
-    print(df.to_string(index=False))
-    
-    # Лучшая стратегия
-    best = comparison.get_best_strategy("precision", min_trades_part=min_trades_part)  # Фильтр по минимальной частоте трейдов (например, 1%)
-    print(f"\n{'='*80}")
-    print(f"BEST STRATEGY: {best['strategy_name']}")
-    print(f"  Type: {best['strategy_type']}")
-    print(f"  Precision: {best['precision']:.4f}")
-    print(f"  Trade Freq: {best['trade_freq']:.4f}")
-    print(f"  N Trades: {best['n_trades']}")
-    print(f"  Hyperparameters: {best['hyperparameters']}")
-    print(f"{'='*80}\n")
-
+    # Запускаем WF
+    # ВАЖНО: нужно передать всю выборку (train + val + test)
+    wf_results = wf_validator.run(
+        strategies=strategies,
+        X=pd.concat([X_train, X_val, X_test]),
+        y=pd.concat([y_train, y_val, y_test]),
+        df_ohlc=df_interim.loc[df.index],
+        splits=splits,
+        barriers=barriers.loc[df.index],
+    )
 
 # ─── CLI - runs from the command line ──────────────────────────────────────
 
@@ -269,8 +262,9 @@ if __name__ == "__main__":
         timeframe   = args.timeframe
         config      = args.config
 
-    run_pipeline(
+    pipe_results = run_pipeline(
         symbol=symbol,
         timeframe=timeframe,
         config=config
     )
+    print("\nPipeline execution completed.")

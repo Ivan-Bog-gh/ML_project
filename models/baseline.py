@@ -8,6 +8,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.base import clone
 
 
 class BaselineClassifier:
@@ -32,6 +33,7 @@ class BaselineClassifier:
                 solver="lbfgs",
                 random_state=42,
             )
+        self.base_estimator = estimator # для последующего воспроизведения аналогичной модели
         
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
@@ -49,6 +51,8 @@ class BaselineClassifier:
             )
         
         self.calibrate = calibrate
+        self.calibration_method = calibration_method
+        self.cv = cv
 
     def fit(self, X: pd.DataFrame, y: pd.Series):
         self.pipeline.fit(X, y)
@@ -82,7 +86,13 @@ class BaselineClassifier:
     def evaluate_roc_auc(self, X: pd.DataFrame, y: pd.Series) -> dict:
         """ROC AUC для бинарной классификации"""
         probs = self.predict_proba(X)
-        roc_auc = roc_auc_score(y, probs[:, 1])
+        y_cnt = len(y.unique())
+        if y_cnt > 2:
+            roc_auc = roc_auc_score(y, probs, multi_class='ovo') # из-за дисбаланса классов
+        elif y_cnt == 2:
+            roc_auc = roc_auc_score(y, probs[:, 1])
+        else:            
+            roc_auc = 0.0  # Если только один класс, AUC не определен
         
         return {"roc_auc": roc_auc}
 
@@ -109,133 +119,81 @@ class BaselineClassifier:
             "precision": precision,
             "trade_freq": trade_freq,
         }
+    
+    def copy(self):
+        init_params = {
+            "estimator": clone(self.base_estimator),
+            "calibrate": self.calibrate,
+            "calibration_method": self.calibration_method,
+            "cv": self.cv if self.calibrate else None,
+        }
+        return BaselineClassifier(**init_params)
 
-class ExpectedValueTrader:
+class BarrierEstimator:
     """
-    Decision layer поверх двух моделей (hit + direction).
-    Считает Expected Value и принимает решения на основе EV.
+    Вычисляет динамические TP/SL барьеры на основе волатильности.
+    
+    Вход:  DataFrame с OHLCV + (опционально) предпосчитанная волатильность
+    Выход: DataFrame с колонками [tp_perc, sl_perc, net_reward, net_loss]
     """
     def __init__(
         self,
-        model_hit: BaselineClassifier,
-        model_direction: BaselineClassifier,
-        tp_reward: float = 1.0,  # R (reward при достижении TP)
-        sl_loss: float = 1.0,    # L (loss при достижении SL)
-        commission: float = 0.001,  # комиссия за сделку
+        com_rate: float = 0.001,      # ставка комиссии (0.1%)
+        atr_window: int = 12,         # окно для ATR (по сути брать из config)
+        k: float = 1.8,               # множитель для ATR (по сути брать из config)
+        tp_atr_mult: float = 1.0,     # TP = tp_atr_mult * ATR
+        sl_atr_mult: float = 1.0      # SL = sl_atr_mult * ATR
     ):
-        self.model_hit = model_hit
-        self.model_direction = model_direction
-        self.tp_reward = tp_reward
-        self.sl_loss = sl_loss
-        self.commission = commission
+        self.com_rate = com_rate
+        self.atr_window = atr_window
+        self.k = k
+        self.tp_atr_mult = tp_atr_mult
+        self.sl_atr_mult = sl_atr_mult
+
+    def fit(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Возвращает DataFrame с барьерами по каждому бару.
+        Внутри считает ATR.
+        
+        Колонки результата:
+            close        — цена закрытия (для расчета sl/tp-price в будущем)
+            tp_perc      — TP барьер (% от цены)
+            sl_perc      — SL барьер (% от цены)
+            next_open    — цена открытия следующей свечи (для расчета ТВХ и результата при таймауте)
+            timeout_result      — фактический результат при достижении таймаута (открытие следующей свечой)
+            timeout_time        — timeout барьер
+            net_reward   — R после комиссии
+            net_loss     — L после комиссии
+            vol          — волатильность (для диагностики)
+            commission          — стоимость комиссии
+            commission_ratio    — доля комиссии от TP (диагностика)
+        """
     
-    def compute_probabilities(self, X: pd.DataFrame) -> dict:
-        """
-        Вычисляет условные вероятности:
-        - P(hit) - вероятность того, что цена достигнет границы
-        - P(long|hit) - вероятность long при условии hit
-        - P(long) = P(hit) * P(long|hit)
-        - P(short) = P(hit) * (1 - P(long|hit))
-        """
-        p_hit = self.model_hit.predict_proba(X)[:, 1]  # вероятность hit (класс 1 из [0, 1])
-        p_long_given_hit = self.model_direction.predict_proba(X)[:, 1]  # P(long|hit) (класс 1 из [-1, 1])
+        # Расчет log returns и volatility
+        log_returns = np.log(df["close"] / df["close"].shift(1))
+        vol = log_returns.rolling(window=self.atr_window).std() * 1.8 # !!! тянуть также из конфига ?
+        timeout_result = df["close"].shift(-self.atr_window) / df["open"].shift(-1) - 1 # Как по факту закрылись
+        timeout_time = df.index.to_series().shift(-self.atr_window).fillna(df.index[-1])
+        # timeout_time = min(df.index.shift(-self.atr_window), df.index[-1]) # Когда закрылись (для диагностики)
         
-        p_long = p_hit * p_long_given_hit
-        p_short = p_hit * (1 - p_long_given_hit)
-        p_no_trade = 1 - p_hit
+        tp_perc = self.k * vol * self.tp_atr_mult * np.sqrt(self.atr_window)
+        sl_perc = self.k * vol * self.sl_atr_mult * np.sqrt(self.atr_window)
         
-        return {
-            "p_hit": p_hit,
-            "p_long_given_hit": p_long_given_hit,
-            "p_long": p_long,
-            "p_short": p_short,
-            "p_no_trade": p_no_trade,
-        }
-    
-    def compute_expected_value(self, X: pd.DataFrame) -> pd.DataFrame:
-        """
-        EV_long = P(long) * R - P(short) * L - commission
-        EV_short = P(short) * R - P(long) * L - commission
-        
-        Где:
-        - R = reward (TP)
-        - L = loss (SL)
-        """
-        probs = self.compute_probabilities(X)
-        
-        ev_long = (
-            probs["p_long"] * self.tp_reward 
-            - probs["p_short"] * self.sl_loss 
-            - self.commission
-        )
-        
-        ev_short = (
-            probs["p_short"] * self.tp_reward 
-            - probs["p_long"] * self.sl_loss 
-            - self.commission
-        )
+        # Комиссия уменьшает reward и увеличивает loss (!!! не учтен вход на открытии следующей свечи)
+        net_reward = (tp_perc - 2 * self.com_rate)
+        net_loss   = (sl_perc + 2 * self.com_rate)
         
         return pd.DataFrame({
-            "ev_long": ev_long,
-            "ev_short": ev_short,
-            "p_long": probs["p_long"],
-            "p_short": probs["p_short"],
-            "p_hit": probs["p_hit"],
-        }, index=X.index)
-    
-    def generate_signals(self, X: pd.DataFrame, min_ev: float = 0.0, min_probability: float = 0.0) -> pd.Series:
-        """
-        Генерирует сигналы на основе Expected Value:
-        - Long если EV_long > min_ev и EV_long > EV_short
-        - Short если EV_short > min_ev и EV_short > EV_long
-        - 0 иначе
-        """
-        ev_df = self.compute_expected_value(X)
-        
-        signals = pd.Series(0, index=X.index)
-        
-        # Long: EV_long максимален и положителен
-        long_mask = (ev_df["ev_long"] > min_ev) & (ev_df["ev_long"] > ev_df["ev_short"])
-        if min_probability > 0:
-            long_mask &= (ev_df["p_long"] > min_probability * ev_df["p_hit"])  # Условие на минимальную вероятность long при условии hit
-        signals[long_mask] = 1
-        
-        # Short: EV_short максимален и положителен
-        short_mask = (ev_df["ev_short"] > min_ev) & (ev_df["ev_short"] > ev_df["ev_long"])
-        if min_probability > 0:
-            short_mask &= (ev_df["p_short"] > min_probability * ev_df["p_hit"])  # Условие на минимальную вероятность short при условии hit
-        signals[short_mask] = -1
-        
-        return signals
-    
-    def evaluate(self, X: pd.DataFrame, y: pd.Series, min_ev: float = 0.0, min_probability: float = 0.0) -> dict:
-        """Оценка производительности EV-based стратегии"""
-        signals = self.generate_signals(X, min_ev, min_probability)
-        
-        traded = signals != 0
-        if traded.sum() == 0:
-            return {
-                "precision": 0.0,
-                "trade_freq": 0.0,
-                "mean_ev": 0.0,
-            }
-        
-        precision = precision_score(
-            y[traded],
-            signals[traded],
-            average="macro",
-            zero_division=0,
-        )
-        
-        trade_freq = traded.mean()
-        
-        ev_df = self.compute_expected_value(X)
-        mean_ev_long = ev_df.loc[signals == 1, "ev_long"].mean() if (signals == 1).sum() > 0 else 0
-        mean_ev_short = ev_df.loc[signals == -1, "ev_short"].mean() if (signals == -1).sum() > 0 else 0
-        
-        return {
-            "precision": precision,
-            "trade_freq": trade_freq,
-            "mean_ev_long": mean_ev_long,
-            "mean_ev_short": mean_ev_short,
-        }
+            "close":            df["close"],
+            "tp_perc":          tp_perc,
+            "sl_perc":          sl_perc,
+            "next_open":        df["open"].shift(-1),
+            "timeout_result":   timeout_result, # от направления зависит, складывать или вычитать с комиссией
+            "timeout_time":     timeout_time,
+            "net_reward":       net_reward,
+            "net_loss":         net_loss,
+            # Удобство для отладки
+            "vol":              vol,
+            "commission":       (2 * self.com_rate),
+            "commission_ratio": (2 * self.com_rate) / tp_perc,
+        }, index=df.index)

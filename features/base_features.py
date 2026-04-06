@@ -179,34 +179,49 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
 def compute_volatility(df: pd.DataFrame) -> pd.DataFrame:
     atr_w = FEATURE_CONFIG["volatility"]["atr_window"]
     vol_ws = FEATURE_CONFIG["volatility"]["vol_windows"]
-    percentile_ws = FEATURE_CONFIG["volatility"]["percentile_windows"]
+    percentile_ws = FEATURE_CONFIG["volatility"]["percentile_windows"] 
+    expansion_ws = FEATURE_CONFIG["volatility"]["expansion_windows"]
+    vol_of_vol_ws = FEATURE_CONFIG["volatility"]["vol_of_vol_windows"]
     
-    atr = compute_atr(df["high"], df["low"], df["close"], atr_w)
-    norm_atr = atr / df["close"]
+    calculations = pd.DataFrame()
+    calculations['atr'] = compute_atr(df["high"], df["low"], df["close"], atr_w)
+    calculations['norm_atr'] = calculations['atr'] / df["close"]
     
-    logret = np.log(df["close"] / df["close"].shift(1))
+    calculations['logret'] = np.log(df["close"] / df["close"].shift(1))
     vol_feats = {}
-    vol_feats["atr_14"] = atr
-    vol_feats["norm_atr_14"] = norm_atr
+    vol_feats["atr_14"] = calculations['atr']
+    vol_feats["norm_atr_14"] = calculations['norm_atr']
     
     for w in vol_ws:
-        vol_feats[f"vol_logret_{w}"] = logret.rolling(w).std()
+        vol_feats[f"vol_logret_{w}"] = calculations['logret'].rolling(w).std()
     
     # (A) Volatility regime positioning
-    vol_20 = logret.rolling(20).std()
+    calculations['vol_20'] = calculations['logret'].rolling(20).std()
     for w in percentile_ws:
-        # vol_feats[f"vol_percentile_{w}"] = vol_20.rolling(w).apply(
-        #     lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
-        # )
-        vol_feats[f"vol_percentile_{w}"] = vol_20.rolling(w).rank(pct=True)
+        vol_feats[f"vol_percentile_{w}"] = calculations['vol_20'].rolling(w).rank(pct=True)
 
     # (B) Volatility slope / expansion
-    vol_10 = logret.rolling(10).std()
-    vol_feats["vol_expansion_ratio"] = vol_10 / (vol_20 + 1e-8)  # ratio
-    vol_feats["vol_expansion_diff"] = vol_10 - vol_20  # difference
+    calculations['vol_10'] = calculations['logret'].rolling(10).std()
+    for short_ws, long_ws in expansion_ws:
+        vol_short = f"vol_{short_ws}"
+        vol_long = f"vol_{long_ws}"
+
+        if vol_short not in calculations.columns:
+            calculations[vol_short] = calculations['logret'].rolling(short_ws).std()
+            
+        if vol_long not in calculations.columns:
+            calculations[vol_long] = calculations['logret'].rolling(long_ws).std()
+
+        vol_feats[f"vol_expansion_ratio_{short_ws}_{long_ws}"] = calculations[vol_short] / (calculations[vol_long] + 1e-8)  # ratio
+        vol_feats[f"vol_expansion_diff_{short_ws}_{long_ws}"] = calculations[vol_short] - calculations[vol_long]  # difference
     
     # (C) Volatility of volatility
-    vol_feats["vol_of_vol_20"] = vol_20.rolling(20).std()
+    for w_1, w_2 in vol_of_vol_ws:
+        vol_w_1 = f"vol_{w_1}"
+        if vol_w_1 not in calculations.columns:
+            calculations[vol_w_1] = calculations['logret'].rolling(w_1).std()
+
+        vol_feats[f"vol_{w_2}_of_vol_{w_1}"] = calculations[vol_w_1].rolling(w_2).std()
     
     df_vol = pd.DataFrame(vol_feats, index=df.index)
     
@@ -301,7 +316,8 @@ def compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_realized_skewness(df: pd.DataFrame) -> pd.DataFrame:
-    windows = FEATURE_CONFIG["realized_skewness"]["windows"]
+    windows = FEATURE_CONFIG["realized_skewness"]["windows"] 
+    intrabar_windows = FEATURE_CONFIG["realized_skewness"]["intrabar_direction_windows"] 
     
     logret = np.log(df["close"] / df["close"].shift(1))
     
@@ -309,11 +325,10 @@ def compute_realized_skewness(df: pd.DataFrame) -> pd.DataFrame:
     for w in windows:
         feats[f"realized_skew_{w}"] = logret.rolling(w).skew()
     
-    # Дополнительно: intrabar directional movement (если есть OHLC)
-    intrabar_range = df["high"] - df["low"]
-    close_position = (df["close"] - df["low"]) / (intrabar_range + 1e-8)  # 0 = close at low, 1 = close at high
+    # Дополнительно: intrabar directional movement
+    close_position = (df["close"] - df["low"]) / (df["high"] - df["low"] + 1e-8)  # 0 = close at low, 1 = close at high
     
-    for w in windows:
+    for w in intrabar_windows:
         feats[f"close_position_mean_{w}"] = close_position.rolling(w).mean()
     
     df_skew = pd.DataFrame(feats, index=df.index)
@@ -339,7 +354,6 @@ FEATURE_COMPUTERS = [
 
 
 def compute_all_features_chunk(args) -> pd.DataFrame:
-# def compute_all_features_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
     """Вычисляем все группы фичей для одного куска данных с учётом overlap"""
     df_chunk, start_idx, end_idx = args
     dfs = []

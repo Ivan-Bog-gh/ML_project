@@ -18,12 +18,16 @@ features:
     atr_window: 14
     vol_windows: [10, 20]
     percentile_windows: [60, 120]  # для regime positioning
+    expansion_windows: [[10, 20]] # для expansion detecting
+    vol_of_vol_windows: [[20, 20]] # для volatility positioning
     
   realized_skewness:
     windows: [20, 60]
+    intrabar_direction_windows: [1, 3, 6, 12]
 
   range:
     windows: [10, 20]
+    body_ratio_window: 1
 
   liquidity:
     zone_lookback: 200
@@ -38,7 +42,7 @@ features:
 
 labeling:
   horizon_bars: 12            # 12 * 5m = 1 hour
-  threshold: 0.01             # 1%
+  threshold: 1.8              # 1.8 * std(horizon_bars)
   side: both                  # long / short / both
   class_weight: "balanced"
 
@@ -49,20 +53,21 @@ model:
     penalty: l2
     solver: lbfgs
     max_iter: 1000
+    class_weight: "balanced"
+    random_state: 42          # Для воспроизводимости результатов
 
 training:
   train_start: "2022-01-01"
-  train_end: "2023-06-01"
-  test_start: "2023-06-01"
+  val_start: "2024-05-01"
+  test_start: "2025-03-01"
   test_end: null
 
 backtest:
-  initial_capital: 100000
+  initial_capital: 10000
   commission_bps: 4
   slippage_bps: 2
-  position_size: 0.02
+  position_size: 0.01
   max_positions: 1
 
 risk:
-  max_drawdown: 0.15
-  min_confidence: 0.55
+  max_drawdown: 0.2

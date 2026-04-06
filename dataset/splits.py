@@ -1,21 +1,27 @@
+# dataset/splits.py
+
 from typing import Iterator, Tuple
 import pandas as pd
 
 
 def time_split(
     df: pd.DataFrame,
-    split_date: str,
+    time_periods: list[str],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Simple time-based train/validation split.
+    Simple time-based train/validation/etc. split.
     """
+    start_time = df.index.min()
+    periods = []
+    for t in time_periods:
+        assert t in df.index, f"Time period {t} not found in DataFrame index"
+        periods.append(df[(df.index < t) & (df.index >= start_time)])
+        start_time = t
+    periods.append(df[df.index >= time_periods[-1]])
 
-    train = df[df.index < split_date]
-    val = df[df.index >= split_date]
+    assert all(len(period) > 0 for period in periods), "Empty split detected"
 
-    assert len(train) > 0 and len(val) > 0, "Empty split detected"
-
-    return train, val
+    return periods
 
 
 def walk_forward_split(

@@ -25,6 +25,7 @@ Important notes:
 """
 
 import logging
+import yaml
 from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
@@ -35,9 +36,10 @@ from pathlib import Path
 
 logger = logging.getLogger("parquet_labeling")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-INTERIM_DIR  = PROJECT_ROOT / "data" / "interim"
-PROCESSED_DIR= PROJECT_ROOT / "data" / "processed"
+PROJECT_ROOT    = Path(__file__).resolve().parents[1]
+INTERIM_DIR     = PROJECT_ROOT / "data" / "interim"
+PROCESSED_DIR   = PROJECT_ROOT / "data" / "processed"
+CONFIG_DIR      = PROJECT_ROOT / "config"
 
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────
@@ -108,6 +110,28 @@ def _label_chunk_optimized(args):
     
     return labels
 
+
+def load_config(config_path=None):
+    """Загрузка конфигурации фич из YAML файла"""
+    if config_path is None:
+        # Автоматический поиск config.yaml
+        current_dir = Path(__file__).parent
+        root_dir = current_dir.parent
+        
+        # Поиск config.yaml в родительской директории
+        config_path = root_dir / "config" / "config.yaml"
+        
+        if not config_path.exists():
+            # Альтернативные пути
+            config_path = root_dir / "configs" / "config.yaml"
+    
+    if not Path(config_path).exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    return config
 
 # ─── MAIN PIPELINE ─────────────────────────────────────────────────────────
 
@@ -185,9 +209,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Инкрементальная загрузка OHLCV с Binance")
     parser.add_argument("--symbol",     default="BTCUSDT",      help="Торговая пара")
     parser.add_argument("--timeframe",  default="5m",           help="Таймфрейм")
-    parser.add_argument("--tl",         default=12,             help="Горизонт событий")
-    parser.add_argument("--k",          default=1.5,            help="Множитель для сигмы")
-    # parser.add_argument("--threshold",  default=0.01,          help="Границы определения событий")
+    parser.add_argument("--config",     default="config.yaml",  help="Путь к конфигу")
     parser.add_argument("--no-args",    action="store_true",    help="Использовать значения по умолчанию без argparse")
 
     args = parser.parse_args()
@@ -196,12 +218,13 @@ if __name__ == "__main__":
     if args.no_args:
         symbol      = "BTCUSDT"
         timeframe   = "5m"
-        tl          = 12
-        k           = 1.8
+        config      = "config.yaml"
     else:
         symbol      = args.symbol
         timeframe   = args.timeframe
-        tl          = args.tl
-        k           = args.k
+        config      = args.config
 
+    config = load_config(CONFIG_DIR / config)  # Загружаем конфиг
+    tl = config.get("labeling", {}).get("horizon_bars", 12)
+    k = config.get("labeling", {}).get("threshold", 1.8)
     compute_event_labels_optimized(symbol=symbol, timeframe=timeframe, tl=tl, k=k)

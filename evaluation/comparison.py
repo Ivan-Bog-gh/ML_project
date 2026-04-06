@@ -23,6 +23,7 @@ class StrategyComparison:
         strategy: TradingStrategy,
         X_val: pd.DataFrame,
         y_val: pd.Series,
+        barriers_val: pd.DataFrame = None,
         metadata: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
         """
@@ -38,16 +39,25 @@ class StrategyComparison:
             dict с результатами
         """
         # Генерируем итоговые сигналы
-        signals = strategy.generate_signals(X_val)
+        signals_df = strategy.generate_signals(X_val, barriers=barriers_val)
+        signals = signals_df["signal"]  # оставляем только колонку сигналов для оценки
         
         # Оцениваем сигналы
         metrics = evaluate_trading_signals(y_val, signals)
+        mask = signals != 0
+        if mask.sum() == 0: # на случай сильного урезания стретегий
+            ev_trade_mean = 0.0
+        else:
+            ev = strategy.compute_expected_value(X=X_val[mask], barriers=barriers_val[mask])  # EV для каждого трейда
+            ev_trade_mean = ev[['ev_long', 'ev_short']].max(axis=1).mean()  # среднее EV по всем трейдам и направлениям
         
         # Формируем результат
         result = {
             "strategy_name": strategy.name,
             "strategy_type": type(strategy).__name__,
+            "strategy_class": type(strategy),
             **metrics,
+            "EV": ev_trade_mean,
             "hyperparameters": strategy.get_hyperparameters(),
         }
         
@@ -76,7 +86,7 @@ class StrategyComparison:
     
     def get_comparison_table(
         self,
-        sort_by: str = "precision",
+        sort_by: str = "EV",
         columns: List[str] = None,
         min_trades_part: float = None,
     ) -> pd.DataFrame:
@@ -89,12 +99,15 @@ class StrategyComparison:
             columns = [
                 "strategy_name",
                 "strategy_type",
+                "strategy_class",
                 "precision",
                 "trade_freq",
                 "n_trades",
                 "long_precision",
                 "short_precision",
                 "f1",
+                "EV",
+                "hyperparameters",
             ]
         
         available_cols = [col for col in columns if col in df.columns]
@@ -108,20 +121,28 @@ class StrategyComparison:
         
         return df
     
-    def get_best_strategy(self, metric: str = "precision", min_trades_part: float = None) -> Dict[str, Any]:
+    def get_best_strategy(
+            self, 
+            metric: str = "EV", 
+            min_trades_part: float = None, 
+            possible_strategies: set = None
+        ) -> Dict[str, Any]:
         """
         Возвращает лучшую стратегию по заданной метрике
         """        
         df = self.get_comparison_table(sort_by=metric, min_trades_part=min_trades_part)
+        if len(possible_strategies) > 0:
+            df = df[df["strategy_name"].isin(possible_strategies)]
         if df.empty:
             return None
         return self.results[df.index[0]]
     
-    def print_summary(self, top_n: int = 10, min_trades_part: float = None):
+    def print_summary(self, top_n: int = 10, min_trades_part: float = None, sort_by: str = "EV"):
         """
         Выводит топ-N стратегий
         """
-        df = self.get_comparison_table(sort_by="precision", min_trades_part=min_trades_part)
+        df = self.get_comparison_table(sort_by=sort_by, min_trades_part=min_trades_part)
+        df = df.drop(labels=['strategy_class', 'hyperparameters'], axis=1) # не нужны для визуала
         
         if df.empty:
             print("No strategies to display.")
