@@ -3,13 +3,47 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from .base_features import parallel_compute
-from .feature_cleaning import clean_features
 
-
+import sys
 PROJECT_ROOT    = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT))
+
+from features.base_features import parallel_compute
+from features.feature_cleaning import clean_features
+
+
 INTERIM_DIR     = PROJECT_ROOT / "data" / "interim"
 PROCESSED_DIR   = PROJECT_ROOT / "data" / "processed"
+
+
+# ─── HELPERS ───────────────────────────────────────────────────────────────
+
+def compute_special_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет базовые микроструктурные признаки.
+    Ожидает колонки: 'open', 'close', 'volume', 'taker_buy_base', 'trades_count'.
+    """
+    df = df.copy()
+    
+    # 1. Дельта объёма (агрессивные покупки минус продажи)
+    df['volume_delta'] = 2 * df['taker_buy_base'] - df['volume']
+    
+    # 2. Дисбаланс объёма (с защитой от деления на ноль)
+    df['volume_imbalance'] = df['volume_delta'] / df['volume'].replace(0, np.nan)
+    
+    # 3. Кумулятивная дельта (CVD)
+    df['cvd'] = df['volume_delta'].fillna(0).cumsum()
+    
+    # 4. Средний размер сделки
+    df['avg_trade_size'] = df['volume'] / df['trades_count'].replace(0, np.nan)
+    
+    # 5. Прокси изменения открытого интереса (OI) — предполагая, что OI растёт при агрессивных покупках/продажах и падает при пассивных сделках
+    df['oi_proxy_delta'] = df['volume_delta'] * np.sign(df['close'] - df['open'])
+    
+    # 6. Кумулятивный прокси OI
+    df['oi_proxy'] = df['oi_proxy_delta'].fillna(0).cumsum()
+    
+    return df
 
 
 # ─── CLI - runs from the command line ──────────────────────────────────────
@@ -27,9 +61,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.no_args:
-        path_in     = INTERIM_DIR / "BTCUSDT_5m.parquet"
-        path_out    = PROCESSED_DIR / "BTCUSDT_5m_features.parquet"
-        labels      = PROCESSED_DIR / "BTCUSDT_5m_labels.parquet"
+        symbol = "BTCUSDT"
+        tf = "dib_temp"
+        path_in     = INTERIM_DIR / f"{symbol}_{tf}.parquet"
+        path_out    = PROCESSED_DIR / f"{symbol}_{tf}_features.parquet"
+        labels      = PROCESSED_DIR / f"{symbol}_{tf}_labels.parquet"
         n_jobs      = -1
     else:
         path_in     = Path(args.input)
@@ -41,6 +77,7 @@ if __name__ == "__main__":
 
     print(f"Reading {path_in} ...")
     df = pd.read_parquet(path_in)
+    df = compute_special_features(df)  # добавляю фичи до параллельного расчёта
 
     print(f"Computing features using {n_jobs} jobs ...")
     features = parallel_compute(df, n_jobs=n_jobs)

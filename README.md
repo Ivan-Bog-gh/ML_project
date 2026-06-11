@@ -342,6 +342,27 @@ All features are computed using strictly past information. Warmup periods and `s
 Config changes: `percentile_windows: [60, 120]` added under `volatility`; new `realized_skewness` block with `windows: [20, 60]`.
 
 
+## Feature Engineering v1.2 — Direction, Microstructure, and DIBs
+
+### New feature groups
+
+**Direction features** — signed short-horizon momentum proxies derived from log-returns and intrabar price structure. 
+	Capture directional pressure that symmetric volatility measures cannot distinguish.
+
+**Microstructure features** — order-flow proxies constructed from volume, price range, and bar-level activity. 
+	Include volume imbalance ratios and normalized spread estimates, computed entirely from OHLCV without external order book data.
+
+**DIBs features** — bar-duration and activity-intensity metrics applicable when input bars are event-driven. 
+	Encode the rate of market activity that generated each bar — information structurally absent when DIBs are treated as equivalent to fixed-time bars.
+
+### Special features
+
+- 	`compute_special_features()` in `build_features.py` computes a subset of microstructural features over the full dataset prior to chunk splitting. 
+	This prevents NaN propagation at chunk boundaries for features requiring long rolling baselines that cannot be satisfied within a single chunk even with overlap.
+
+All v1.2 features follow the same causality and suspend_flag rules as prior versions.
+
+
 ## Dataset Assembly
 
 A dedicated `dataset/` module handles the assembly of modeling-ready datasets.
