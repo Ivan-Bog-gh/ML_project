@@ -18,7 +18,6 @@ PROJECT_ROOT    = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
 from backtest.engine import BacktestEngine
-from backtest.metrics import calculate_performance_metrics
 from evaluation.comparison import StrategyComparison
 from evaluation.strategies import TradingStrategy
 

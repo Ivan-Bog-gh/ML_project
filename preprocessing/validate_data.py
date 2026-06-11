@@ -178,6 +178,31 @@ def validate_extreme_values(df: pd.DataFrame) -> bool:
 
     return True
 
+def validate_dib(df_dib: pd.DataFrame):
+    """Очень странные / нереалистичные значения для DIB"""
+    issues = {}
+    
+    # Аномально длинные бары по времени (вероятно, гэп в данных)
+    bar_duration = df_dib['close_time'] - df_dib['open_time']
+    issues['long_bars'] = df_dib[bar_duration > pd.Timedelta(hours=8)]
+    
+    # Бары с нулевым объёмом (не должно быть в DIB по определению)
+    issues['zero_volume'] = df_dib[df_dib['volume'] == 0]
+    
+    # Дубликаты по времени открытия
+    issues['duplicates'] = df_dib[df_dib['open_time'].duplicated()]
+    
+    # Перекрывающиеся бары
+    overlaps = df_dib['open_time'] < df_dib['close_time'].shift()
+    issues['overlaps'] = df_dib[overlaps]
+    
+    for k, v in issues.items():
+        if not v.empty:
+            logger.warning(f"DIB validation — {k}: {len(v)} случаев")
+            return False
+    
+    return True
+
 
 # ------------------------------------------------------------------------------------
 #  Главная функция-оркестратор
@@ -195,6 +220,7 @@ def run_all_validations(df: pd.DataFrame, timeframe: str) -> bool:
         ("Консистентность OHLCV",    validate_ohlcv_consistency),
         ("Пропущенные значения",     validate_missing_values),
         ("Экстремальные значения",   validate_extreme_values),
+        ("DIB validation",           validate_dib),
     ]
 
     all_passed = True
@@ -203,7 +229,9 @@ def run_all_validations(df: pd.DataFrame, timeframe: str) -> bool:
 
     for name, func in checks:
         logger.info(f"→ {name} ...")
-        passed = func(df)
+        if name != "DIB validation" or timeframe.upper().find("IB") >= 0: # Проверка "DIB validation" только для DIB
+            if name != "Непрерывность времени" or timeframe.upper().find("IB") < 0: # Проверка "Непрерывность времени" только не для DIB
+                passed = func(df)
         if not passed:
             all_passed = False
         # можно добавить короткий статус в одну строку, если хочется

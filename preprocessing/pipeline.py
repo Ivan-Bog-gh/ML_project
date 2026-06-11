@@ -1,11 +1,16 @@
 # preprocessing/pipeline.py
 import argparse
-
-from .clean_ohlcv import clean_ohlcv
-from .align_time import align_time_controlled
-from .validate_data import run_all_validations 
 from pathlib import Path
+
+import sys
+PROJECT_ROOT    = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT))
+
+from preprocessing.clean_ohlcv import clean_ohlcv
+from preprocessing.align_time import align_time_controlled
+from preprocessing.validate_data import run_all_validations 
 import pandas as pd
+import numpy as np
 import logging
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +33,7 @@ INTERIM_DIR  = PROJECT_ROOT / "data" / "interim"
 
 def process_raw_to_interim(symbol: str, timeframe: str):
     symbol = symbol.upper()
+    timeframe = timeframe.lower()
     raw_path        = RAW_DIR     / f"{symbol}_{timeframe}.parquet"
     interim_path    = INTERIM_DIR / f"{symbol}_{timeframe}.parquet"
     
@@ -43,6 +49,16 @@ def process_raw_to_interim(symbol: str, timeframe: str):
     try:
         df = pd.read_parquet(raw_path)
         logger.info(f"Прочитано {len(df):,} строк")
+        if "timestamp" in df.columns:   # На случай взятия из другого источника, где может быть такое название (DIB)
+            df.rename(columns={"timestamp": "close_time"}, inplace=True)  # На всякий случай убираем пробелы в названиях
+            df["open_time"] = df["close_time"].shift().fillna(df.iloc[0]["close_time"]-1) + 1  # На всякий случай убираем пробелы в названиях
+            # print(f"0/-1: {pd.to_datetime(df.iloc[0]['close_time'], unit='ms')}, {pd.to_datetime(df.iloc[-1]['close_time'], unit='ms')}")
+            
+            mask_close = df["close_time"] < 5e12  # Если в микросекундах, а не миллисекундах
+            df["close_time"] = pd.to_datetime(np.where(mask_close, df["close_time"], df["close_time"] / 1000), unit='ms')
+            
+            mask_open = df["open_time"] < 5e12  # Если в микросекундах, а не миллисекундах
+            df["open_time"] = pd.to_datetime(np.where(mask_open, df["open_time"], df["open_time"] / 1000), unit='ms')
     except Exception as e:
         logger.exception(f"Ошибка чтения parquet: {e}")
         return
@@ -50,7 +66,8 @@ def process_raw_to_interim(symbol: str, timeframe: str):
     logger.info("Начинаем очистку данных")
 
     df = clean_ohlcv(df)
-    df = align_time_controlled(df, timeframe)
+    if timeframe.find("ib") == -1: # Если не Imbalance Bar
+        df = align_time_controlled(df, timeframe)
     success = run_all_validations(df, timeframe)
     
     if success:

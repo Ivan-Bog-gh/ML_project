@@ -28,7 +28,6 @@ from evaluation.comparison import StrategyComparison, compare_strategies_grid
 
 from backtest.engine import BacktestEngine
 from backtest.walk_forward import WalkForwardAnalysis
-from backtest.metrics import calculate_performance_metrics, print_performance_summary
 
 
 

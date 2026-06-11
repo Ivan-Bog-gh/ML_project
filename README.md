@@ -157,7 +157,7 @@ Returns are computed relative to the close price at t.
 
 ### TP / SL logic
 
-A fixed symmetric threshold is applied:
+A fixed symmetric threshold is not applied:
 
 - 	+1 (long event)
 	If the future maximum price exceeds the current price by at least the threshold before reaching -SL.
@@ -179,6 +179,17 @@ It doesn't mean:
 -	market was flat
 
 It means that no directional movement exceeded transaction-cost-adjusted thresholds within the given horizon, making any trade statistically unjustified under the defined setup.
+
+### DIBs compatibility
+
+The labeling pipeline supports non-uniform bar structures (Dollar Imbalance Bars and similar event-driven aggregations) in addition to fixed-interval OHLCV bars.
+
+Key adaptations:
+- 	TP/SL path traversal no longer assumes equal bar spacing
+- 	`threshold_tp` and `threshold_sl` are configured independently, enabling asymmetric barrier setup
+- 	`compute_dib_thresholds()` precomputes per-bar barrier boundaries before labeling, consistent with variable bar duration
+
+Validation checks specific to DIBs (overlaps, zero-volume bars, anomalous durations) are available via `validate_dib()` in `preprocessing/validate_ohlcv.py` and activate automatically when DIBs mode is enabled in config.
 
 
 ### Modeling Philosophy

@@ -46,40 +46,73 @@ CONFIG_DIR      = PROJECT_ROOT / "config"
 
 def _label_chunk_optimized(args):
     """
-    Оптимизированная обработка: итерация по времени (tl),
-    а не по каждой строке полностью
+    Оптимизированная обработка Triple Barrier для DIB.
+    
+    Горизонт задаётся не числом баров (tl), а временем (horizon_seconds),
+    поэтому для каждой строки i_start..i_end вычисляем индивидуальный
+    максимальный future-индекс через timestamps.
+    
+    Labels:
+         1  — hit upper barrier (TP)
+        -1  — hit lower barrier (SL)
+         2  — hit both simultaneously
+         0  — горизонт истёк без касания
+        NaN — горизонт вышел за пределы массива (недостаточно данных)
     """
-    i_start, i_end, close, high, low, tl, thresholds = args
-    
+    (
+        i_start,
+        i_end,
+        close,       # np.ndarray float32, все бары
+        high,        # np.ndarray float32, все бары
+        low,         # np.ndarray float32, все бары
+        timestamps,  # np.ndarray float64 (unix seconds), все бары
+        tp_thresholds,  # np.ndarray float32, индивидуальный TP % для каждого бара
+        sl_thresholds,  # np.ndarray float32, индивидуальный SL % для каждого бара
+        horizon_seconds,  # int/float: временной горизонт в секундах
+    ) = args
+
     n_rows = i_end - i_start
-    labels = np.full(n_rows, np.nan, dtype=np.float32)  # изначально все NaN
-    
-    # Маска: True = строка ещё не получила финальную метку
-    active_mask = np.ones(n_rows, dtype=bool)
-    
-    # Предвычисляем границы для всех активных строк
-    entries = close[i_start:i_end]
-    row_thresholds = thresholds[i_start:i_end]
-    upper_bounds = entries * (1 + row_thresholds)
-    lower_bounds = entries * (1 - row_thresholds)
-    
-    # Итерируемся по шагам времени вперёд
-    for t in range(1, tl + 1):
-        # Индексы в будущем для каждой строки чанка
+    labels = np.full(n_rows, np.nan, dtype=np.float32)
+
+    entries        = close[i_start:i_end]
+    upper_bounds   = entries * (1 + tp_thresholds[i_start:i_end])
+    lower_bounds   = entries * (1 - sl_thresholds[i_start:i_end])
+    entry_times    = timestamps[i_start:i_end]
+
+    # Для каждой строки — максимальный индекс будущего бара в горизонте
+    # np.searchsorted быстрее, чем цикл
+    horizon_end_times = entry_times + horizon_seconds
+    # Последний индекс бара, который ещё входит в горизонт
+    max_future_indices = np.searchsorted(timestamps, horizon_end_times, side='right') - 1
+    # Если горизонт полностью вышел за пределы массива — оставляем NaN
+    has_enough_data = max_future_indices < len(close)
+    active_mask = has_enough_data.copy()  # строки без данных сразу исключаем
+
+    # Максимальное число шагов — ограничиваем чтобы не гонять пустой цикл
+    max_steps = int((max_future_indices - np.arange(i_start, i_end)).max()) if active_mask.any() else 0
+
+    for t in range(1, max_steps + 1):
         future_indices = np.arange(i_start, i_end) + t
-        
-        # Проверяем, не вышли ли за пределы массива
-        valid_future = future_indices < len(close)
-        check_mask = active_mask & valid_future
-        
+
+        # Активна строка если: ещё не помечена И future не превышает её горизонт
+        within_horizon = future_indices <= max_future_indices
+        check_mask = active_mask & within_horizon
+
+        exhausted = active_mask & ~within_horizon
+        if np.any(exhausted):
+            labels[exhausted] = 0
+            active_mask[exhausted] = False
+
         if not np.any(check_mask):
             break  # все строки либо обработаны, либо вышли за пределы
         
         # Получаем будущие цены только для активных строк
         check_indices = np.where(check_mask)[0]
-        future_high = high[future_indices[check_indices]]
-        future_low = low[future_indices[check_indices]]
-        
+        fi = future_indices[check_indices]
+
+        future_high = high[fi]
+        future_low  = low[fi]
+
         # Проверяем касания границ
         hit_upper = future_high >= upper_bounds[check_indices]
         hit_lower = future_low <= lower_bounds[check_indices]
@@ -87,29 +120,64 @@ def _label_chunk_optimized(args):
         # Обрабатываем одновременные касания (pos_u == pos_l)
         both_hit = hit_upper & hit_lower
         if np.any(both_hit):
-            both_indices = check_indices[both_hit]
-            labels[both_indices] = 2
-            active_mask[both_indices] = False
-        
-        # Обрабатываем только верхнее касание
-        only_upper = hit_upper & ~hit_lower & active_mask[check_indices]
-        if np.any(only_upper):
-            upper_indices = check_indices[only_upper]
-            labels[upper_indices] = 1
-            active_mask[upper_indices] = False
-        
-        # Обрабатываем только нижнее касание
-        only_lower = hit_lower & ~hit_upper & active_mask[check_indices]
-        if np.any(only_lower):
-            lower_indices = check_indices[only_lower]
-            labels[lower_indices] = -1
-            active_mask[lower_indices] = False
-    
-    # Оставшиеся активные строки = не было касаний
-    labels[active_mask & (np.arange(i_start, i_end) + tl < len(close))] = 0
-    
-    return labels
+            idx = check_indices[both_hit]
+            labels[idx] = 2
+            active_mask[idx] = False
 
+        # Обрабатываем только верхнее касание
+        only_upper = hit_upper & ~hit_lower
+        if np.any(only_upper):
+            idx = check_indices[only_upper]
+            labels[idx] = 1
+            active_mask[idx] = False
+
+        # Обрабатываем только нижнее касание
+        only_lower = hit_lower & ~hit_upper
+        if np.any(only_lower):
+            idx = check_indices[only_lower]
+            labels[idx] = -1
+            active_mask[idx] = False
+
+    # Оставшиеся активные строки = не было касаний
+    expired = active_mask & has_enough_data
+    labels[expired] = 0
+
+    return labels  # shape: (n_rows,), dtype float32
+
+def compute_dib_thresholds(df, price_col='close', 
+                            window_seconds=3600,  # rolling окно по времени
+                            horizon_seconds=3600,  # горизонт лейблинга (1ч)
+                            k=1.8):
+    """
+    Пороги для DIB через временное rolling окно.
+    Scaling через реальное время бара, а не sqrt(n_bars).
+    """
+
+    log_returns = np.log(df[price_col] / df[price_col].shift(1)).rename('log_returns')
+
+    # [1] Rolling по времени вместо баров
+    rolling_std = (
+        pd.concat([log_returns, df['close_time']], axis=1)
+        .rolling(
+            window=pd.Timedelta(seconds=window_seconds),
+            min_periods=5,
+            on='close_time'   # строка — имя колонки
+        )['log_returns']
+        .std()
+    )
+    
+    # [2] Аннуализация через реальную длительность бара
+    bar_duration = df['close_time'].diff().dt.total_seconds().bfill().rolling(window=5, min_periods=1).mean()  # сглаживаем шум длительности бара
+    bar_duration = bar_duration.clip(lower=1.0)  # минимум 1 секунда чтобы не взрываться
+
+    # Volatility scaling: σ_horizon = σ_bar * sqrt(horizon / bar_duration)
+    # Для DIB bar_duration варьируется → индивидуальный scaling
+    time_scale = np.sqrt(horizon_seconds / bar_duration)
+
+    thresholds_tp = (k * rolling_std * time_scale).fillna(0).values
+    thresholds_sl = (k * rolling_std * time_scale).fillna(0).values  # можно задать асимметрию
+
+    return thresholds_tp, thresholds_sl
 
 def load_config(config_path=None):
     """Загрузка конфигурации фич из YAML файла"""
@@ -158,17 +226,18 @@ def compute_event_labels_optimized(
         return
         
     df = pd.read_parquet(interim_path)
-    
-    # Расчет log returns и rolling std
-    log_returns = np.log(df[price_col] / df[price_col].shift(1))
-    rolling_std = log_returns.rolling(window=tl).std()
 
     # Динамические пороги для каждой строки
-    thresholds = (k * rolling_std * np.sqrt(tl)).fillna(0).values  # заполняем NaN нулями
+    horizon_seconds = (tl * pd.Timedelta(timeframe)).seconds if timeframe.find("ib") == -1 else 3600  # для imbalance_bar tl — вообще не смотрим, задаём фиксированное время
+    thresholds_tp, thresholds_sl = compute_dib_thresholds(df, price_col=price_col,
+                                                        window_seconds=horizon_seconds,
+                                                        horizon_seconds=horizon_seconds,
+                                                        k=k)
 
     close = df[price_col].values
     high = df[high_col].values
     low = df[low_col].values
+    timestamps = df['close_time'].astype('int64').values / 1e9  # float64
     n = len(df)
     
     # Размер чанка - баланс между параллелизмом и overhead
@@ -176,7 +245,7 @@ def compute_event_labels_optimized(
     chunk_size = max(1000, n // n_cores + 1)
     
     chunks = [
-        (i, min(i + chunk_size, n), close, high, low, tl, thresholds)
+        (i, min(i + chunk_size, n), close, high, low, timestamps, thresholds_tp, thresholds_sl, horizon_seconds)
         for i in range(0, n, chunk_size)
     ]
     
@@ -217,7 +286,7 @@ if __name__ == "__main__":
     # Если явно попросили игнорировать аргументы → используем старый удобный пример
     if args.no_args:
         symbol      = "BTCUSDT"
-        timeframe   = "5m"
+        timeframe   = "dib_temp"
         config      = "config.yaml"
     else:
         symbol      = args.symbol
